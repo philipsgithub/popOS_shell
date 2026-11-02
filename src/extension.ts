@@ -2687,10 +2687,11 @@ export class Ext extends Ecs.System<ExtEvent> {
 
             const grab_focus = () => {
                 this.schedule_idle(() => {
-                    this.windows.with(entity, (window) => {
-                        window.meta.raise();
-                        window.meta.unminimize();
-                        window.activate(false);
+                    // Activate from the event queue: workspace.activate_with_focus()
+                    // in the middle of a frame can crash Mutter. activate() also
+                    // unminimizes and raises the window.
+                    this.register_fn(() => {
+                        this.windows.with(entity, (window) => window.activate(false));
                     });
 
                     return false;
