@@ -14,7 +14,7 @@ import { Executor } from './executor.js';
 export type Entity = [number, number];
 
 export function entity_eq(a: Entity, b: Entity): boolean {
-    return a[0] == b[0] && b[1] == b[1];
+    return a[0] === b[0] && a[1] === b[1];
 }
 
 export function entity_new(pos: number, gen: number): Entity {
@@ -99,7 +99,9 @@ export class Storage<T> {
         let [id, gen] = entity;
 
         let length = this.store.length;
-        if (length >= id) {
+        if (id >= length) {
+            // fill() does not grow the array by itself
+            this.store.length = id + 1;
             this.store.fill(null, length, id);
         }
 
@@ -187,7 +189,7 @@ export class World {
     /// Iterates across entities in the world
     *entities(): IterableIterator<Entity> {
         for (const entity of this.entities_.values()) {
-            if (!(this.free_slots.indexOf(entity[0]) > -1)) yield entity;
+            if (this.free_slots.indexOf(entity[0]) === -1) yield entity;
         }
     }
 
@@ -197,7 +199,7 @@ export class World {
     create_entity(): Entity {
         let slot = this.free_slots.pop();
 
-        if (slot) {
+        if (slot !== undefined) {
             var entity = this.entities_[slot];
             entity[1] += 1;
         } else {
@@ -248,7 +250,7 @@ export class World {
     /// Unregisters an old component storage from our world
     unregister_storage(storage: Storage<any>) {
         let matched = this.storages.indexOf(storage);
-        if (matched) {
+        if (matched !== -1) {
             swap_remove(this.storages, matched);
         }
     }
