@@ -49,10 +49,10 @@ depcheck:
 	fi
 
 enable:
-	gnome-extensions enable "pop-shell@system76.com"
+	env UUID="$(UUID)" sh scripts/enable.sh
 
 disable:
-	gnome-extensions disable "pop-shell@system76.com"
+	-gnome-extensions disable "$(UUID)"
 
 listen:
 	journalctl -o cat -n 0 -f "$$(which gnome-shell)" | grep -v warning
