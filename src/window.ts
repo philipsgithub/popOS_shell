@@ -28,6 +28,19 @@ let SCHEDULED_RESTACK: number | null = null;
 /** Contains SourceID of an active hint operation. */
 let ACTIVE_HINT_SHOW_ID: number | null = null;
 
+/** Cancels the module-wide restack and active hint timers. Call on extension disable. */
+export function clear_timers() {
+    if (SCHEDULED_RESTACK !== null) {
+        GLib.source_remove(SCHEDULED_RESTACK);
+        SCHEDULED_RESTACK = null;
+    }
+
+    if (ACTIVE_HINT_SHOW_ID !== null) {
+        GLib.source_remove(ACTIVE_HINT_SHOW_ID);
+        ACTIVE_HINT_SHOW_ID = null;
+    }
+}
+
 const WM_TITLE_BLACKLIST: Array<string> = [
     'Firefox',
     'Nightly', // Firefox Nightly

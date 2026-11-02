@@ -183,6 +183,9 @@ export class Ext extends Ecs.System<ExtEvent> {
 
     was_locked: boolean = false;
 
+    /** False between a real (non-lock-screen) disable and the next enable */
+    active: boolean = false;
+
     /** Set when a window is being moved by the mouse */
     moved_by_mouse: boolean = false;
 
@@ -224,6 +227,9 @@ export class Ext extends Ecs.System<ExtEvent> {
 
     /** Signals which have been registered for each window */
     window_signals: Ecs.Storage<Array<SignalID>> = this.register_storage();
+
+    /** The `destroy` handler attached to each window's actor */
+    actor_signals: Ecs.Storage<[Clutter.Actor, SignalID]> = this.register_storage();
 
     // Systems
 
@@ -1698,7 +1704,7 @@ export class Ext extends Ecs.System<ExtEvent> {
         let win = this.get_window(window);
         if (win) {
             const entity = win.entity;
-            actor.connect('destroy', () => {
+            const destroy_id = actor.connect('destroy', () => {
                 if (win && win.border) {
                     win.border.destroy();
                     win.border = null;
@@ -1708,6 +1714,8 @@ export class Ext extends Ecs.System<ExtEvent> {
 
                 return false;
             });
+
+            this.actor_signals.insert(entity, [actor, destroy_id]);
 
             if (win.is_tilable(this)) {
                 this.connect_window(win);
@@ -2087,18 +2095,12 @@ export class Ext extends Ecs.System<ExtEvent> {
             this.prev_focused = [null, null];
         });
 
-        St.ThemeContext.get_for_stage(global.stage).connect('notify::scale-factor', () => this.update_scale());
+        this.connect(St.ThemeContext.get_for_stage(global.stage), 'notify::scale-factor', () => this.update_scale());
 
-        // Modes
-
-        if (this.settings.tile_by_default() && !this.auto_tiler) {
-            this.auto_tiler = new auto_tiler.AutoTiler(
-                new Forest.Forest()
-                    .connect_on_attach(this.on_tile_attach.bind(this))
-                    .connect_on_detach(this.on_tile_detach.bind(this)),
-                this.register_storage<Entity>(),
-            );
-        }
+        // The auto-tiler is created by `auto_tile_on()`, which `enable()` calls
+        // right after this when tile-by-default is set. Creating one here too
+        // leaked a tiler (and its storage) per enable, and made every
+        // pre-existing window wait on a `first-frame` signal that never fires.
 
         // Post-init
 
@@ -2109,6 +2111,50 @@ export class Ext extends Ecs.System<ExtEvent> {
 
             this.register_fn(() => (this.init = false));
         }
+    }
+
+    /** Cancels every pending timer owned by the extension. */
+    timers_clear() {
+        for (const id of this.size_requests.values()) GLib.source_remove(id);
+        this.size_requests.clear();
+
+        if (this.workareas_update !== null) {
+            GLib.source_remove(this.workareas_update);
+            this.workareas_update = null;
+        }
+
+        if (this.displays_updating !== null) {
+            GLib.source_remove(this.displays_updating);
+            this.displays_updating = null;
+        }
+
+        Window.clear_timers();
+    }
+
+    /**
+     * Disconnects from every tracked window and drops its entity, so that the
+     * next `signals_attach()` re-registers all windows from scratch, exactly
+     * like the first enable does.
+     */
+    windows_forget() {
+        for (const [entity, window] of Array.from(this.windows.iter())) {
+            this.window_signals.take_with(entity, (signals) => {
+                for (const signal of signals) window.meta.disconnect(signal);
+            });
+
+            this.actor_signals.take_with(entity, ([actor, signal]) => actor.disconnect(signal));
+
+            if (window.border) {
+                window.border.destroy();
+                window.border = null;
+            }
+
+            this.delete_entity(entity);
+        }
+
+        this.prev_focused = [null, null];
+        this.workspace_active.clear();
+        this.init = true;
     }
 
     signals_remove() {
@@ -2682,6 +2728,9 @@ export default class PopShellExtension extends Extension {
             });
         }
 
+        ext.active = true;
+        ext.dbus.start();
+
         if (ext.settings.show_skiptaskbar()) {
             _show_skip_taskbar_windows(ext);
         } else {
@@ -2723,6 +2772,8 @@ export default class PopShellExtension extends Extension {
             delete globalThis.popShellExtension;
             ext.injections_remove();
             ext.signals_remove();
+            ext.unset_grab_op();
+            ext.timers_clear();
             ext.exit_modes();
             ext.stop_launcher_services();
             ext.hide_all_borders();
@@ -2733,11 +2784,22 @@ export default class PopShellExtension extends Extension {
             ext.keybindings.disable(ext.keybindings.global).disable(ext.keybindings.window_focus);
 
             if (ext.auto_tiler) {
+                ext.unregister_storage(ext.auto_tiler.attached);
                 ext.auto_tiler.destroy(ext);
                 ext.auto_tiler = null;
             }
 
             _hide_skip_taskbar_windows();
+
+            // Untiling has queued moves that restore each window's original geometry;
+            // only drop the windows once those have run. If we are re-enabled
+            // first, keep them (the windows are then simply still tracked).
+            const disabled = ext;
+            disabled.active = false;
+            disabled.dbus.stop();
+            disabled.register_fn(() => {
+                if (!disabled.active) disabled.windows_forget();
+            });
         }
 
         if (indicator) {

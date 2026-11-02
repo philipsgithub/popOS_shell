@@ -16,6 +16,19 @@ import { Button } from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import GLib from 'gi://GLib';
 import { spawn } from 'resource:///org/gnome/shell/misc/util.js';
 import { get_current_path } from './paths.js';
+
+/** Pending "close the menu shortly" timers; cancelled when the indicator is destroyed. */
+const MENU_CLOSE_TIMERS: Set<number> = new Set();
+
+function close_menu_soon(menu: any) {
+    const id: number = GLib.timeout_add(GLib.PRIORITY_LOW, 300, () => {
+        MENU_CLOSE_TIMERS.delete(id);
+        menu.close();
+        return false;
+    });
+
+    MENU_CLOSE_TIMERS.add(id);
+}
 // import * as Settings from './settings.js';
 
 export class Indicator {
@@ -102,6 +115,9 @@ export class Indicator {
     }
 
     destroy() {
+        for (const id of MENU_CLOSE_TIMERS) GLib.source_remove(id);
+        MENU_CLOSE_TIMERS.clear();
+
         this.button.destroy();
     }
 }
@@ -144,10 +160,7 @@ function floating_window_exceptions(ext: Ext, menu: any): any {
     base.connect('activate', () => {
         ext.exception_dialog();
 
-        GLib.timeout_add(GLib.PRIORITY_LOW, 300, () => {
-            menu.close();
-            return false;
-        });
+        close_menu_soon(menu);
     });
 
     return base;
@@ -364,10 +377,7 @@ function color_selector(ext: Ext, menu: any) {
         }
 
         // clean up and focus on the color dialog
-        GLib.timeout_add(GLib.PRIORITY_LOW, 300, () => {
-            menu.close();
-            return false;
-        });
+        close_menu_soon(menu);
     });
 
     return color_selector_item;

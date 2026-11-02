@@ -58,15 +58,21 @@ export class OnceExecutor<X, T extends Iterable<X>> {
                         return false;
                     });
 
+                this.#signal = null;
                 return false;
             }
 
-            return apply(next);
+            const keep_going = apply(next);
+            if (!keep_going) this.#signal = null;
+            return keep_going;
         });
     }
 
     stop() {
-        if (this.#signal !== null) GLib.source_remove(this.#signal);
+        if (this.#signal !== null) {
+            GLib.source_remove(this.#signal);
+            this.#signal = null;
+        }
     }
 }
 
@@ -92,12 +98,18 @@ export class ChannelExecutor<X> {
 
         this.#signal = GLib.timeout_add(GLib.PRIORITY_DEFAULT, delay, () => {
             const e = this.#channel.shift();
+            if (typeof e === 'undefined') return true;
 
-            return typeof e === 'undefined' ? true : apply(e);
+            const keep_going = apply(e);
+            if (!keep_going) this.#signal = null;
+            return keep_going;
         });
     }
 
     stop() {
-        if (this.#signal !== null) GLib.source_remove(this.#signal);
+        if (this.#signal !== null) {
+            GLib.source_remove(this.#signal);
+            this.#signal = null;
+        }
     }
 }

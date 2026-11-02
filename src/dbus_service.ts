@@ -37,6 +37,12 @@ export class Service {
 
     constructor() {
         this.dbus = Gio.DBusExportedObject.wrapJSObject(IFACE, this);
+        this.id = null;
+    }
+
+    /** Owns `com.System76.PopShell` and exports the interface. Idempotent. */
+    start() {
+        if (this.id !== null) return;
 
         const onBusAcquired = (conn: any) => {
             this.dbus.export(conn, '/com/System76/PopShell');
@@ -56,7 +62,17 @@ export class Service {
         );
     }
 
-    destroy() {
+    /** Releases the name and unexports the interface, so calls stop reaching a disabled extension. */
+    stop() {
+        if (this.id === null) return;
+
         Gio.bus_unown_name(this.id);
+        this.id = null;
+
+        try {
+            this.dbus.unexport();
+        } catch (_) {
+            // Not exported yet (the bus was never acquired).
+        }
     }
 }
