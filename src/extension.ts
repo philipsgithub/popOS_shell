@@ -44,13 +44,7 @@ import Gio from 'gi://Gio';
 import St from 'gi://St';
 import Shell from 'gi://Shell';
 import Meta from 'gi://Meta';
-// Try to import Mtk for newer GNOME versions, fallback to Meta for older versions
-let Mtk: any;
-try {
-    Mtk = imports.gi.Mtk;
-} catch (e) {
-    Mtk = null;
-}
+import Mtk from 'gi://Mtk';
 const { GlobalEvent, WindowEvent } = Events;
 const { cursor_rect, is_keyboard_op, is_resize_op, is_move_op } = Lib;
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -570,7 +564,7 @@ export class Ext extends Ecs.System<ExtEvent> {
                 try {
                     const [bytes] = stdout.read_line_finish(res);
                     if (bytes) {
-                        if (event_handler((imports.byteArray.toString(bytes) as string).trim())) {
+                        if (event_handler(utils.decode(bytes).trim())) {
                             ipc.stdout.read_line_async(0, ipc.cancellable, generator);
                         }
                     }
@@ -2630,10 +2624,7 @@ export class Ext extends Ecs.System<ExtEvent> {
 
     cursor_status(): [Rectangle, number] {
         const cursor = cursor_rect();
-        // Use Mtk.Rectangle if available (newer GNOME), otherwise fallback to Meta.Rectangle
-        const rect = Mtk ?
-            new Mtk.Rectangle({ x: cursor.x, y: cursor.y, width: 1, height: 1 }) :
-            new Meta.Rectangle({ x: cursor.x, y: cursor.y, width: 1, height: 1 });
+        const rect = new Mtk.Rectangle({ x: cursor.x, y: cursor.y, width: 1, height: 1 });
         const monitor = display.get_monitor_index_for_rect(rect);
         return [cursor, monitor];
     }

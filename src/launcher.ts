@@ -294,7 +294,7 @@ export class Launcher extends search.Search {
                     try {
                         let f = Gio.File.new_for_path(`/proc/${pid}/cmdline`);
                         const [, bytes] = f.load_contents(null);
-                        const output: string = imports.byteArray.toString(bytes);
+                        const output: string = utils.decode(bytes);
                         const cmd = output.split(' ').shift()?.split('/').pop();
                         if (cmd === exec) return window;
                     } catch (_) {}

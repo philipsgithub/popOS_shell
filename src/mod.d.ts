@@ -1,5 +1,11 @@
 declare const global: Global, imports: any, log: any, _: (arg: string) => string;
 
+/** Provided by GJS; not part of the ES2020 lib this project compiles against. */
+declare class TextDecoder {
+    constructor(label?: string);
+    decode(input?: Uint8Array | ArrayBuffer): string;
+}
+
 interface Global {
     get_current_time(): number;
     get_pointer(): [number, number];
@@ -64,6 +70,11 @@ declare module 'gi://Meta' {
     export default Meta;
 }
 
+declare module 'gi://Mtk' {
+    let Mtk: any;
+    export default Mtk;
+}
+
 declare module 'gi://Gtk' {
     let Gtk: any;
     export default Gtk;
@@ -107,7 +118,7 @@ declare module 'gi://GLib' {
         timeout_add(priority: number, ms: number, callback: () => boolean): number;
 
         get_user_config_dir(): string;
-        file_get_contents(filename: string): string;
+        file_get_contents(filename: string): [boolean, Uint8Array];
     }
     let gLib: GLib;
     export default gLib;

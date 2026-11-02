@@ -3,7 +3,6 @@ import * as log from './log.js';
 
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
-const { byteArray } = imports;
 
 /** Reads JSON responses from the launcher service asynchronously, and sends requests.
  *
@@ -21,7 +20,7 @@ export class LauncherService {
             try {
                 const [bytes] = stdout.read_line_finish(res);
                 if (bytes) {
-                    const string = byteArray.toString(bytes);
+                    const string = utils.decode(bytes);
                     // log.debug(`received response from launcher service: ${string}`)
                     callback(JSON.parse(string));
                     this.service.stdout.read_line_async(0, this.service.cancellable, generator);
