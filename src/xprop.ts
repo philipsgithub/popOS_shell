@@ -1,79 +1,21 @@
-import * as lib from './lib.js';
+import * as log from './log.js';
 
-import GLib from 'gi://GLib';
+import Gio from 'gi://Gio';
 import { spawn } from 'resource:///org/gnome/shell/misc/util.js';
 
 export var MOTIF_HINTS: string = '_MOTIF_WM_HINTS';
 export var HIDE_FLAGS: string[] = ['0x2', '0x0', '0x0', '0x0', '0x0'];
 export var SHOW_FLAGS: string[] = ['0x2', '0x0', '0x1', '0x0', '0x0'];
 
-//export var FRAME_EXTENTS: string = "_GTK_FRAME_EXTENTS"
+const FRAME_EXTENTS: string = '_GTK_FRAME_EXTENTS';
 
-export function get_window_role(xid: string): string | null {
-    let out = xprop_cmd(xid, 'WM_WINDOW_ROLE');
+/** What an X11 window's properties say about whether we may toggle its decorations. */
+export interface DecorationInfo {
+    /** The client draws its own frame (GTK CSD sets `_GTK_FRAME_EXTENTS`). */
+    client_decorated: boolean;
 
-    if (!out) return null;
-
-    return parse_string(out);
-}
-
-export function get_frame_extents(xid: string): string | null {
-    let out = xprop_cmd(xid, "_GTK_FRAME_EXTENTS");
-
-    if (!out) return null;
-
-    return parse_string(out)
-}
-
-export function get_hint(xid: string, hint: string): Array<string> | null {
-    let out = xprop_cmd(xid, hint);
-
-    if (!out) return null;
-
-    const array = parse_cardinal(out);
-
-    return array ? array.map((value) => (value.startsWith('0x') ? value : '0x' + value)) : null;
-}
-
-function size_params(line: string): [number, number] | null {
-    let fields = line.split(' ');
-    let x = lib.dbg(lib.nth_rev(fields, 2));
-    let y = lib.dbg(lib.nth_rev(fields, 0));
-
-    if (!x || !y) return null;
-
-    let xn = parseInt(x, 10);
-    let yn = parseInt(y, 10);
-
-    return isNaN(xn) || isNaN(yn) ? null : [xn, yn];
-}
-
-export function get_size_hints(xid: string): lib.SizeHint | null {
-    let out = xprop_cmd(xid, 'WM_NORMAL_HINTS');
-    if (out) {
-        let lines = out.split('\n')[Symbol.iterator]();
-        lines.next();
-
-        let minimum: string | undefined = lines.next().value;
-        let increment: string | undefined = lines.next().value;
-        let base: string | undefined = lines.next().value;
-
-        if (!minimum || !increment || !base) return null;
-
-        let min_values = size_params(minimum);
-        let inc_values = size_params(increment);
-        let base_values = size_params(base);
-
-        if (!min_values || !inc_values || !base_values) return null;
-
-        return {
-            minimum: min_values,
-            increment: inc_values,
-            base: base_values,
-        };
-    }
-
-    return null;
+    /** No Motif hints, or hints that only say "all" / "none", i.e. values we set ourselves. */
+    may_decorate: boolean;
 }
 
 export function get_xid(meta: Meta.Window): string | null {
@@ -82,47 +24,63 @@ export function get_xid(meta: Meta.Window): string | null {
     return match && match[0];
 }
 
-export function may_decorate(xid: string): boolean {
-    const hints = motif_hints(xid);
-    return hints ? hints[2] == '0x0' || hints[2] == '0x1' : true;
-}
-
-export function motif_hints(xid: string): Array<string> | null {
-    return get_hint(xid, MOTIF_HINTS);
-}
-
 export function set_hint(xid: string, hint: string, value: string[]) {
     spawn(['xprop', '-id', xid, '-f', hint, '32c', '-set', hint, value.join(', ')]);
 }
 
-function consume_key(string: string): number | null {
-    const pos = string.indexOf('=');
-    return -1 == pos ? null : pos;
+/**
+ * Reads the decoration-related properties of an X11 window without blocking
+ * the compositor. `callback` is not called if `xprop` fails (for example when
+ * the window is already gone).
+ */
+export function read_decoration_info(xid: string, callback: (info: DecorationInfo) => void) {
+    let proc: any;
+    try {
+        proc = Gio.Subprocess.new(
+            ['xprop', '-id', xid, FRAME_EXTENTS, MOTIF_HINTS],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_SILENCE,
+        );
+    } catch (why) {
+        log.warn(`failed to spawn xprop: ${why}`);
+        return;
+    }
+
+    proc.communicate_utf8_async(null, null, (p: any, res: any) => {
+        let stdout: string;
+        try {
+            [, stdout] = p.communicate_utf8_finish(res);
+        } catch (why) {
+            log.warn(`failed to read xprop output: ${why}`);
+            return;
+        }
+
+        if (!p.get_successful() || !stdout) return;
+
+        callback(parse_decoration_info(stdout));
+    });
 }
 
-function parse_cardinal(string: string): Array<string> | null {
-    const pos = consume_key(string);
-    return pos
-        ? string
-              .slice(pos + 1)
-              .trim()
-              .split(', ')
-        : null;
-}
+function parse_decoration_info(output: string): DecorationInfo {
+    let client_decorated = false;
+    let motif: string[] | null = null;
 
-function parse_string(string: string): string | null {
-    const pos = consume_key(string);
-    return pos
-        ? string
-              .slice(pos + 1)
-              .trim()
-              .slice(1, -1)
-        : null;
-}
+    for (const line of output.split('\n')) {
+        // A missing property prints `NAME:  not found.`; a present one `NAME(TYPE) = values`.
+        const pos = line.indexOf('=');
+        if (pos === -1) continue;
 
-function xprop_cmd(xid: string, args: string): string | null {
-    let xprops = GLib.spawn_command_line_sync(`xprop -id ${xid} ${args}`);
-    if (!xprops[0]) return null;
+        if (line.startsWith(FRAME_EXTENTS)) {
+            client_decorated = true;
+        } else if (line.startsWith(MOTIF_HINTS)) {
+            motif = line
+                .slice(pos + 1)
+                .trim()
+                .split(', ')
+                .map((v) => (v.startsWith('0x') ? v : '0x' + v));
+        }
+    }
 
-    return imports.byteArray.toString(xprops[1]);
+    const may_decorate = motif ? motif[2] === '0x0' || motif[2] === '0x1' : true;
+
+    return { client_decorated, may_decorate };
 }

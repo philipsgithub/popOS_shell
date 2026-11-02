@@ -296,6 +296,7 @@ declare namespace Meta {
         get_compositor_private(): Clutter.Actor | null;
         get_display(): Meta.Display | null;
         get_description(): string;
+        get_client_type(): number;
         get_frame_rect(): Rectangular;
         get_monitor(): number;
         get_pid(): number;

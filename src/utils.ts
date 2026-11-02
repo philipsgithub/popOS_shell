@@ -5,7 +5,6 @@ import * as log from './log.js';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
-import Meta from 'gi://Meta';
 const { Ok, Err } = result;
 const { Error } = error;
 
@@ -14,14 +13,6 @@ const UTF8_DECODER = new TextDecoder('utf-8');
 /** Decodes bytes returned by GLib/Gio (e.g. load_contents, read_line_finish) as UTF-8. */
 export function decode(bytes: Uint8Array): string {
     return UTF8_DECODER.decode(bytes);
-}
-
-export function is_wayland(): boolean {
-    if (typeof Meta.is_wayland_compositor === 'function') {
-        return Meta.is_wayland_compositor();
-    }
-    // GNOME 50+ removed X11 support; always Wayland
-    return true;
 }
 
 export function block_signal(object: GObject.Object, signal: SignalID) {

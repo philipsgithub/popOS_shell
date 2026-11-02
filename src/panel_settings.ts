@@ -1,4 +1,3 @@
-import * as Utils from './utils.js';
 
 import type { Ext } from './extension.js';
 
@@ -36,7 +35,7 @@ export class Indicator {
     appearances: any;
 
     toggle_tiled: any;
-    toggle_titles: null | any;
+    toggle_titles: null | any = null;
     toggle_active: any;
     border_radius: any;
 
@@ -100,10 +99,9 @@ export class Indicator {
         bm.addMenuItem(settings_button(bm));
         bm.addMenuItem(menu_separator(''));
 
-        if (!Utils.is_wayland()) {
-            this.toggle_titles = show_title(ext);
-            bm.addMenuItem(this.toggle_titles);
-        }
+        // Also offered on Wayland: it applies to X11 apps running under Xwayland.
+        this.toggle_titles = show_title(ext);
+        bm.addMenuItem(this.toggle_titles);
 
         bm.addMenuItem(this.toggle_active);
         bm.addMenuItem(this.border_radius);

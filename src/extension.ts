@@ -1674,17 +1674,11 @@ export class Ext extends Ecs.System<ExtEvent> {
         const show_title = this.settings.show_title();
 
         if (indicator) {
-            indicator.toggle_titles.setToggleState(show_title);
+            indicator.toggle_titles?.setToggleState(show_title);
         }
 
         for (const window of this.windows.values()) {
-            if (window.is_client_decorated()) continue;
-
-            if (show_title) {
-                window.decoration_show(this);
-            } else {
-                window.decoration_hide(this);
-            }
+            window.update_decoration(this);
         }
     }
 

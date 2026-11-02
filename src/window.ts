@@ -60,9 +60,10 @@ enum RESTACK_SPEED {
 }
 
 interface X11Info {
-    normal_hints: once_cell.OnceCell<lib.SizeHint | null>;
-    wm_role_: once_cell.OnceCell<string | null>;
     xid_: once_cell.OnceCell<string | null>;
+
+    /** Read once, before we change the window's Motif hints ourselves */
+    decoration: xprop.DecorationInfo | null;
 }
 
 export class ShellWindow {
@@ -94,9 +95,8 @@ export class ShellWindow {
     private was_hidden: boolean = false;
 
     private extra: X11Info = {
-        normal_hints: new OnceCell(),
-        wm_role_: new OnceCell(),
         xid_: new OnceCell(),
+        decoration: null,
     };
 
     private border_size = 0;
@@ -115,15 +115,7 @@ export class ShellWindow {
             ext.add_tag(entity, Tags.Floating);
         }
 
-        if (this.may_decorate()) {
-            if (!this.is_client_decorated()) {
-                if (ext.settings.show_title()) {
-                    this.decoration_show(ext);
-                } else {
-                    this.decoration_hide(ext);
-                }
-            }
-        }
+        this.update_decoration(ext);
 
         this.bind_window_events();
         this.bind_hint_events();
@@ -237,25 +229,37 @@ export class ShellWindow {
         return out;
     }
 
-    private decoration(_ext: Ext, callback: (xid: string) => void): void {
-        if (this.may_decorate()) {
-            const xid = this.xid();
-            if (xid) callback(xid);
-        }
-    }
-
-    decoration_hide(ext: Ext): void {
+    /**
+     * Applies the show-window-titles setting to this window's server-side
+     * decorations. Only X11 windows (including Xwayland ones) have decorations
+     * we can toggle. Their properties are read asynchronously, once.
+     */
+    update_decoration(ext: Ext): void {
         if (this.ignore_decoration()) return;
 
-        this.was_hidden = true;
+        const xid = this.xid();
+        if (!xid) return;
 
-        this.decoration(ext, (xid) => xprop.set_hint(xid, xprop.MOTIF_HINTS, xprop.HIDE_FLAGS));
-    }
+        const apply = (info: xprop.DecorationInfo) => {
+            if (this.destroying || info.client_decorated || !info.may_decorate) return;
 
-    decoration_show(ext: Ext): void {
-        if (!this.was_hidden) return;
+            if (ext.settings.show_title()) {
+                if (this.was_hidden) xprop.set_hint(xid, xprop.MOTIF_HINTS, xprop.SHOW_FLAGS);
+            } else {
+                this.was_hidden = true;
+                xprop.set_hint(xid, xprop.MOTIF_HINTS, xprop.HIDE_FLAGS);
+            }
+        };
 
-        this.decoration(ext, (xid) => xprop.set_hint(xid, xprop.MOTIF_HINTS, xprop.SHOW_FLAGS));
+        if (this.extra.decoration) {
+            apply(this.extra.decoration);
+            return;
+        }
+
+        xprop.read_decoration_info(xid, (info) => {
+            if (!this.extra.decoration) this.extra.decoration = info;
+            apply(this.extra.decoration);
+        });
     }
 
     icon(_ext: Ext, size: number): any {
@@ -276,16 +280,6 @@ export class ShellWindow {
         const name = this.meta.get_wm_class();
         if (name === null) return true;
         return WM_TITLE_BLACKLIST.findIndex((n) => name.startsWith(n)) !== -1;
-    }
-
-    is_client_decorated(): boolean {
-        // look I guess I'll hack something together in here if at all possible
-        // Because Meta.Window.is_client_decorated() was removed in Meta 15, using it breaks the extension in gnome 47 or higher
-        //return this.meta.window_type == Meta.WindowType.META_WINDOW_OVERRIDE_OTHER;
-        const xid = this.xid();
-        const extents = xid ? xprop.get_frame_extents(xid) : false;
-        if (!extents) return false;
-        return true;
     }
 
     is_maximized(): boolean {
@@ -362,11 +356,6 @@ export class ShellWindow {
         return this.meta.get_transient_for() !== null;
     }
 
-    may_decorate(): boolean {
-        const xid = this.xid();
-        return xid ? xprop.may_decorate(xid) : false;
-    }
-
     move(ext: Ext, rect: Rectangular, on_complete?: () => void) {
         if (!this.same_workspace() && this.is_maximized()) {
             return;
@@ -414,13 +403,6 @@ export class ShellWindow {
         return Rect.Rectangle.from_meta(this.meta.get_frame_rect());
     }
 
-    size_hint(): lib.SizeHint | null {
-        return this.extra.normal_hints.get_or_init(() => {
-            const xid = this.xid();
-            return xid ? xprop.get_size_hints(xid) : null;
-        });
-    }
-
     swap(ext: Ext, other: ShellWindow): void {
         let ar = this.rect().clone();
         let br = other.rect().clone();
@@ -432,13 +414,6 @@ export class ShellWindow {
     title(): string {
         const title = this.meta.get_title();
         return title ? title : this.name(this.ext);
-    }
-
-    wm_role(): string | null {
-        return this.extra.wm_role_.get_or_init(() => {
-            const xid = this.xid();
-            return xid ? xprop.get_window_role(xid) : null;
-        });
     }
 
     workspace_id(): number {
@@ -453,7 +428,8 @@ export class ShellWindow {
 
     xid(): string | null {
         return this.extra.xid_.get_or_init(() => {
-            if (utils.is_wayland()) return null;
+            // Per window, not per session: X11 clients under Xwayland have an XID too.
+            if (this.meta.get_client_type() !== Meta.WindowClientType.X11) return null;
             return xprop.get_xid(this.meta);
         });
     }
