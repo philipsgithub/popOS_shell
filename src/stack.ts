@@ -91,8 +91,10 @@ const TabButton = GObject.registerClass(
                 }),
             );
 
-            close_button.connect('clicked', () => {
+            // Only ever request closing once (pop-os/shell#1794)
+            const on_close: number = close_button.connect('clicked', () => {
                 window.meta.delete(global.get_current_time());
+                close_button.disconnect(on_close);
             });
 
             close_button.set_x_align(Clutter.ActorAlign.END);
