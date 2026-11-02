@@ -115,5 +115,5 @@ if gnome-extensions list | grep native-window; then
     gnome-extensions enable $(gnome-extensions list | grep native-window)
 fi
 
-# Workspaces spanning displays works better with Pop Shell
-dconf write /org/gnome/mutter/workspaces-only-on-primary false
+# Leave org.gnome.mutter workspaces-only-on-primary as the user set it:
+# Pop Shell supports both settings.
