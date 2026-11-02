@@ -41,7 +41,7 @@ export const DEFAULT_FLOAT_RULES: Array<FloatRule> = [
     { class: 'update-manager', title: 'Software Updater' },
     { class: 'Solaar' },
     { class: 'Steam', title: '^((?!Steam).)*$' },
-    { class: 'Steam', title: '^.*(Guard|Login).*' },
+    { class: 'Steam', title: '^.*(Guard|Login|Sign in).*' },
     { class: 'TelegramDesktop', title: 'Media viewer' },
     { class: 'Zotero', title: 'Quick Format Citation' },
     { class: 'firefox', title: '^(?!.*Mozilla Firefox).*$' },
