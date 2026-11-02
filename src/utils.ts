@@ -5,10 +5,26 @@ import * as log from './log.js';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
+import Meta from 'gi://Meta';
 const { Ok, Err } = result;
 const { Error } = error;
 
 const UTF8_DECODER = new TextDecoder('utf-8');
+
+/*
+ * Mutter 18 (GNOME 50) dropped the flags argument of Meta.Window.maximize()
+ * and unmaximize(); with no arguments they act on both directions. Older
+ * versions require the flags.
+ */
+export function maximize(meta: Meta.Window) {
+    if (meta.maximize.length === 0) meta.maximize();
+    else meta.maximize(Meta.MaximizeFlags.BOTH);
+}
+
+export function unmaximize(meta: Meta.Window) {
+    if (meta.unmaximize.length === 0) meta.unmaximize();
+    else meta.unmaximize(Meta.MaximizeFlags.BOTH);
+}
 
 /** Decodes bytes returned by GLib/Gio (e.g. load_contents, read_line_finish) as UTF-8. */
 export function decode(bytes: Uint8Array): string {
