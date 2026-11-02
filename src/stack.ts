@@ -507,13 +507,30 @@ export class Stack {
             this.prev_active_id = 0;
         }
 
+        const was_active = Ecs.entity_eq(entity, this.active);
+
         let idx = 0;
         for (const c of this.tabs) {
             if (Ecs.entity_eq(c.entity, entity)) {
                 this.remove_tab_component(c, idx);
-                if (this.active_id > idx) {
-                    this.active_id -= 1;
+
+                // Keep the indices on their tabs, and inside the stack
+                if (this.active_id > idx) this.active_id -= 1;
+                if (this.prev_active_id > idx) this.prev_active_id -= 1;
+                if (this.tabs.length) {
+                    this.active_id = Math.min(this.active_id, this.tabs.length - 1);
+                    this.prev_active_id = Math.min(this.prev_active_id, this.tabs.length - 1);
                 }
+
+                // Closing the active tab shows the previously active one
+                if (was_active && this.prev_active && this.tabs.length) {
+                    this.activate(this.prev_active);
+
+                    // activate() recorded the removed tab as previously active
+                    this.prev_active = null;
+                    this.prev_active_id = 0;
+                }
+
                 return idx;
             }
             idx += 1;
