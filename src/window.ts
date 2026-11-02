@@ -670,8 +670,9 @@ export class ShellWindow {
                 const screen = utils.monitor_exists(monitor) ? workspace.get_work_area_for_monitor(monitor) : null;
 
                 if (screen) {
-                    width = Math.min(width, screen.x + screen.width);
-                    height = Math.min(height, screen.y + screen.height);
+                    // Clamp to the work area's far edges, measured from the border's position
+                    width = Math.min(width, screen.x + screen.width - x);
+                    height = Math.min(height, screen.y + screen.height - y);
                 }
 
                 border.set_position(x, y);
