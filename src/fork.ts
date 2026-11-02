@@ -264,6 +264,12 @@ export class Fork {
         }
     }
 
+    /**
+     * Moves this toplevel tree to `monitor`/`workspace` and fits it to `area`.
+     * The windows are expected to be there already (Mutter put them there);
+     * their own workspace is left alone, since on a non-primary monitor with
+     * workspaces-only-on-primary the tree's `workspace` is just 0.
+     */
     migrate(ext: Ext, forest: Forest, area: Rectangle, monitor: number, workspace: number) {
         if (ext.auto_tiler && this.is_toplevel) {
             const primary = global.display.get_primary_monitor() === monitor;
@@ -289,9 +295,6 @@ export class Fork {
                         let window = ext.windows.get(child.inner.entity);
                         if (window) {
                             ext.size_signals_block(window);
-                            window.reassignment = false;
-                            window.known_workspace = workspace;
-                            window.meta.change_workspace_by_index(workspace, true);
                             ext.monitors.insert(window.entity, [monitor, workspace]);
                             blocked.push(window);
                         }
@@ -307,8 +310,6 @@ export class Fork {
 
                             if (window) {
                                 ext.size_signals_block(window);
-                                window.known_workspace = workspace;
-                                window.meta.change_workspace_by_index(workspace, true);
                                 ext.monitors.insert(window.entity, [monitor, workspace]);
                                 blocked.push(window);
                             }

@@ -11,6 +11,25 @@ const { Error } = error;
 
 const UTF8_DECODER = new TextDecoder('utf-8');
 
+/** Monitor indices go stale while displays are unplugged; Mutter asserts on unknown ones. */
+export function monitor_exists(monitor: number): boolean {
+    return monitor >= 0 && monitor < global.display.get_n_monitors();
+}
+
+/** The connector (e.g. `DP-8`, `eDP-1`) of a monitor; unlike its index, it survives hotplugs. */
+export function monitor_connector(monitor: number): string | null {
+    for (const logical of global.backend.get_monitor_manager().get_logical_monitors()) {
+        if (logical.get_number() === monitor) return logical.get_monitors()[0]?.get_connector() ?? null;
+    }
+
+    return null;
+}
+
+/** The index of the monitor on `connector`, or -1 if it is not connected. */
+export function monitor_for_connector(connector: string): number {
+    return global.backend.get_monitor_manager().get_monitor_for_connector(connector);
+}
+
 /*
  * Mutter 18 (GNOME 50) dropped the flags argument of Meta.Window.maximize()
  * and unmaximize(); with no arguments they act on both directions. Older

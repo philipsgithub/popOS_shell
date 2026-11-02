@@ -21,7 +21,6 @@ import * as Executor from './executor.js';
 import * as movement from './movement.js';
 import * as stack from './stack.js';
 import * as add_exception from './dialog_add_exception.js';
-import * as exec from './executor.js';
 import * as dbus_service from './dbus_service.js';
 import * as scheduler from './scheduler.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -191,6 +190,9 @@ export class Ext extends Ecs.System<ExtEvent> {
 
     private workareas_update: null | SignalID = null;
 
+    /** True while Mutter moves windows after a monitor change, until `reassign_trees_to_displays()` */
+    display_reconfiguring: boolean = false;
+
     /** Record of misc. global objects and their attached signals */
     private signals: Map<GObject.Object, Array<SignalID>> = new Map();
 
@@ -358,12 +360,18 @@ export class Ext extends Ecs.System<ExtEvent> {
                         break;
 
                     case WindowEvent.Size:
+                        // Mutter is relocating windows; reassign_trees_to_displays() handles them
+                        if (this.display_reconfiguring) break;
+
                         if (this.auto_tiler && !win.is_maximized() && !win.meta.is_fullscreen()) {
                             this.auto_tiler.reflow(this, win.entity);
                         }
                         break;
 
                     case WindowEvent.Workspace:
+                        if (this.display_reconfiguring) break;
+
+                        win.update_home_workspace(false);
                         this.on_workspace_changed(win);
                         break;
 
@@ -611,44 +619,6 @@ export class Ext extends Ecs.System<ExtEvent> {
         return [primary, this.displays[1].get(primary) as Display];
     }
 
-    find_unused_workspace(monitor: number): [number, any] {
-        if (!this.auto_tiler) return [0, wom.get_workspace_by_index(0)];
-
-        let id = 0;
-
-        const tiled_windows = new Array<Window.ShellWindow>();
-
-        for (const [window] of this.auto_tiler.attached.iter()) {
-            if (!this.auto_tiler.attached.contains(window)) continue;
-
-            const win = this.windows.get(window);
-
-            if (win && !win.reassignment && win.meta.get_monitor() === monitor) tiled_windows.push(win);
-        }
-
-        cancel: while (true) {
-            for (const window of tiled_windows) {
-                if (window.workspace_id() === id) {
-                    id += 1;
-                    continue cancel;
-                }
-            }
-
-            break;
-        }
-
-        let new_work;
-
-        if (id + 1 === wom.get_n_workspaces()) {
-            id += 1;
-            new_work = wom.append_new_workspace(true, global.get_current_time());
-        } else {
-            new_work = wom.get_workspace_by_index(id);
-        }
-
-        return [id, new_work];
-    }
-
     focus_left() {
         this.stack_select(
             (id, stack) => (id === 0 ? null : stack.tabs[id - 1].entity),
@@ -750,6 +720,9 @@ export class Ext extends Ecs.System<ExtEvent> {
     }
 
     monitor_work_area(monitor: number): Rectangle {
+        // Asking Mutter about a monitor that was unplugged yields an empty rectangle.
+        if (!utils.monitor_exists(monitor)) monitor = global.display.get_primary_monitor();
+
         const meta = wom.get_active_workspace().get_work_area_for_monitor(monitor);
 
         return Rect.Rectangle.from_meta(meta as Rectangular);
@@ -1882,6 +1855,14 @@ export class Ext extends Ecs.System<ExtEvent> {
             });
         }
 
+        this.connect(display, 'window-entered-monitor', (_display: Meta.Display, _monitor: number, meta: Meta.Window) => {
+            // Queued, so that a reconfiguration flagged by monitors-changed is seen
+            this.register_fn(() => {
+                if (this.display_reconfiguring) return;
+                this.get_window(meta)?.update_home_monitor();
+            });
+        });
+
         this.connect(display, 'workareas-changed', () => {
             this.update_display_configuration(true);
         });
@@ -1934,6 +1915,10 @@ export class Ext extends Ecs.System<ExtEvent> {
         }
 
         this.connect(layoutManager, 'monitors-changed', () => {
+            // Set before the queue runs: it already holds the workspace and
+            // size events of the windows Mutter just moved, which must not
+            // be acted on (see reassign_trees_to_displays).
+            this.display_reconfiguring = true;
             this.register(Events.global(GlobalEvent.MonitorsChanged));
         });
 
@@ -2119,6 +2104,8 @@ export class Ext extends Ecs.System<ExtEvent> {
             GLib.source_remove(this.displays_updating);
             this.displays_updating = null;
         }
+
+        this.display_reconfiguring = false;
 
         Window.clear_timers();
     }
@@ -2334,11 +2321,18 @@ export class Ext extends Ecs.System<ExtEvent> {
     update_display_configuration_before() { }
 
     update_display_configuration(workareas_only: boolean) {
-        if (!this.auto_tiler || sessionMode.isLocked) return;
+        // Work-area updates during a monitor change are part of it
+        if (this.display_reconfiguring) workareas_only = false;
+
+        if (!this.auto_tiler || sessionMode.isLocked) {
+            if (this.displays_updating === null) this.display_reconfiguring = false;
+            return;
+        }
 
         if (this.ignore_display_update) {
             this.ignore_display_update = false;
-            return;
+            // Only skip the work-area refresh a new workspace causes, never a monitor change.
+            if (workareas_only) return;
         }
 
         // Ignore the update if there are no monitors to assign to
@@ -2388,81 +2382,6 @@ export class Ext extends Ecs.System<ExtEvent> {
             return;
         }
 
-        // Update every tree on each display with the new dimensions
-        const update_tiling = () => {
-            if (!this.auto_tiler) return;
-
-            for (const f of this.auto_tiler.forest.forks.values()) {
-                if (!f.is_toplevel) continue;
-
-                const display = this.monitor_work_area(f.monitor);
-
-                if (display) {
-                    const area = new Rect.Rectangle([display.x, display.y, display.width, display.height]);
-
-                    f.smart_gapped = false;
-                    f.set_area(area.clone());
-                    this.auto_tiler.update_toplevel(this, f, f.monitor, this.settings.smart_gaps());
-                }
-            }
-        };
-
-        type Migration = [Fork, number, Rectangle, boolean];
-
-        let migrations: Array<Migration> = new Array();
-
-        const apply_migrations = (assigned_monitors: Set<number>) => {
-            if (!migrations) return;
-
-            new exec.OnceExecutor<Migration, Migration[]>(migrations).start(
-                500,
-                ([fork, new_monitor, workspace, find_workspace]) => {
-                    let new_workspace;
-
-                    if (find_workspace) {
-                        if (assigned_monitors.has(new_monitor)) {
-                            [new_workspace] = this.find_unused_workspace(new_monitor);
-                        } else {
-                            assigned_monitors.add(new_monitor);
-                            new_workspace = 0;
-                        }
-                    } else {
-                        new_workspace = fork.workspace;
-                    }
-
-                    fork.migrate(this, forest, workspace, new_monitor, new_workspace);
-                    fork.set_ratio(fork.length() / 2);
-
-                    return true;
-                },
-                () => update_tiling(),
-            );
-        };
-
-        function mark_for_reassignment(ext: Ext, fork: Ecs.Entity) {
-            for (const win of forest.iter(fork, node.NodeKind.WINDOW)) {
-                if (win.inner.kind === 2) {
-                    const entity = win.inner.entity;
-                    const window = ext.windows.get(entity);
-                    if (window) window.reassignment = true;
-                }
-            }
-        }
-
-        const [old_primary, old_displays] = this.displays;
-
-        const changes = new Map<number, number>();
-
-        // Records which display's windows were moved to what new display's ID
-        for (const [entity, w] of this.windows.iter()) {
-            if (!w.actor_exists()) continue;
-
-            this.monitors.with(entity, ([mon]) => {
-                const assignment = mon === old_primary ? primary_display : w.meta.get_monitor();
-                changes.set(mon, assignment);
-            });
-        }
-
         // Fetch a new list of monitors
         const updated = new Map();
 
@@ -2475,19 +2394,13 @@ export class Ext extends Ecs.System<ExtEvent> {
             updated.set(mon.index, { area, ws });
         }
 
-        const forest = this.auto_tiler.forest;
-
-        if (old_displays.size === updated.size) {
-            update_tiling();
-
-            this.displays = [primary_display, updated];
-
-            return;
-        }
+        const old_displays = this.displays[1];
 
         this.displays = [primary_display, updated];
 
-        if (utils.map_eq(old_displays, updated)) {
+        // Work areas changed (panels, struts, resolution): just refit the trees.
+        if (workareas_only && old_displays.size === updated.size) {
+            this.retile_toplevels();
             return;
         }
 
@@ -2498,60 +2411,208 @@ export class Ext extends Ecs.System<ExtEvent> {
             this.workareas_update = null;
         }
 
-        // Delay actions in case of temporary connection loss
-        this.displays_updating = GLib.timeout_add(GLib.PRIORITY_DEFAULT, 2000, () => {
-            (() => {
-                if (!this.auto_tiler) return;
+        // Mutter is now moving windows between monitors. Leave them alone until
+        // things settle (docks bring monitors up one by one, connections may
+        // flap), then reassign every tree in one pass.
+        this.display_reconfiguring = true;
 
-                const toplevels = new Array();
-                const assigned_monitors = new Set<number>();
+        const settle = (attempt: number) => {
+            this.displays_updating = GLib.timeout_add(GLib.PRIORITY_DEFAULT, attempt === 0 ? 2000 : 250, () => {
+                this.displays_updating = null;
 
-                for (const [old_mon, new_mon] of changes) {
-                    if (old_mon === new_mon) assigned_monitors.add(new_mon);
+                // Wayland clients take a moment to follow a move to another monitor
+                if (this.return_windows_to_home_monitors() && attempt < 8) {
+                    settle(attempt + 1);
+                } else {
+                    this.display_reconfiguring = false;
+                    this.reassign_trees_to_displays();
                 }
 
-                for (const f of forest.forks.values()) {
-                    if (f.is_toplevel) {
-                        toplevels.push(f);
+                return false;
+            });
+        };
 
-                        let migration: null | [Fork, number, Rectangle, boolean] = null;
+        settle(0);
+    }
 
-                        const displays = this.displays[1];
+    /**
+     * Mutter's placement of windows is unreliable while a dock brings its
+     * monitors up one by one. Moves every window whose monitor is connected
+     * (again) back onto it; returns whether any window is not there yet.
+     */
+    return_windows_to_home_monitors(): boolean {
+        let moving = false;
 
-                        for (const [old_monitor, new_monitor] of changes) {
-                            const display = displays.get(new_monitor);
+        for (const win of this.windows.values()) {
+            if (win.home_monitor === null || !win.actor_exists()) continue;
 
-                            if (!display) continue;
+            const home = utils.monitor_for_connector(win.home_monitor);
+            if (home === -1 || home === win.meta.get_monitor()) continue;
 
-                            if (f.monitor === old_monitor) {
-                                f.monitor = new_monitor;
-                                f.workspace = 0;
-                                migration = [f, new_monitor, display.ws, true];
-                            }
-                        }
+            if (win.is_maximized() || win.meta.is_fullscreen()) {
+                win.meta.move_to_monitor(home);
+            } else {
+                // move_to_monitor() ignores windows Mutter has in that half-moved
+                // state; place it inside the monitor (it is retiled afterwards).
+                const area = this.monitor_work_area(home);
+                const rect = win.meta.get_frame_rect();
+                const width = Math.min(rect.width, area.width);
+                const height = Math.min(rect.height, area.height);
+                const x = area.x + Math.round((area.width - width) / 2);
+                const y = area.y + Math.round((area.height - height) / 2);
+                win.meta.move_resize_frame(true, x, y, width, height);
+            }
 
-                        if (!migration) {
-                            const display = displays.get(f.monitor);
-                            if (display) {
-                                migration = [f, f.monitor, display.ws, false];
-                            }
-                        }
+            moving = true;
+        }
 
-                        if (migration) {
-                            mark_for_reassignment(this, migration[0].entity);
-                            migrations.push(migration);
-                        }
-                    }
+        return moving;
+    }
+
+    /** Fits every toplevel tree to the current work area of its monitor. */
+    retile_toplevels() {
+        if (!this.auto_tiler) return;
+
+        for (const f of this.auto_tiler.forest.forks.values()) {
+            if (!f.is_toplevel) continue;
+
+            const display = this.monitor_work_area(f.monitor);
+            const area = new Rect.Rectangle([display.x, display.y, display.width, display.height]);
+
+            f.smart_gapped = false;
+            f.set_area(area.clone());
+            this.auto_tiler.update_toplevel(this, f, f.monitor, this.settings.smart_gaps());
+        }
+    }
+
+    /**
+     * After monitors were added or removed, makes the tiling trees follow
+     * their windows to wherever Mutter put them, keeping every window on its
+     * workspace.
+     *
+     * - A tree whose windows all share one destination, which no other tree
+     *   claims, moves there intact (splits and ratios are kept).
+     * - Otherwise the tree is dissolved, and each of its windows is tiled
+     *   into the tree at its own destination (merging into what's there).
+     */
+    reassign_trees_to_displays() {
+        const tiler = this.auto_tiler;
+        if (!tiler) return;
+
+        const forest = tiler.forest;
+
+        // With workspaces-only-on-primary, a window that passed through a
+        // secondary monitor lost its workspace: Mutter leaves it on all
+        // workspaces, or drops it on the active one, once it is back on the
+        // primary. Send it back home.
+        const n_workspaces = global.workspace_manager.get_n_workspaces();
+        for (const win of this.windows.values()) {
+            const home = win.home_workspace;
+            if (home === null || home >= n_workspaces || !win.actor_exists()) continue;
+
+            const meta = win.meta;
+            if (this.should_ignore_workspace(meta.get_monitor()) || meta.is_always_on_all_workspaces()) continue;
+
+            // Still having a home means the user did not pin it to all
+            // workspaces; have Mutter re-evaluate that now it is on the primary.
+            if (meta.is_on_all_workspaces()) {
+                meta.stick();
+                meta.unstick();
+            }
+
+            if (meta.get_workspace()?.index() !== home) meta.change_workspace_by_index(home, false);
+        }
+
+        const destination = (win: Window.ShellWindow): [number, number] => {
+            const [monitor, workspace] = this.workspace_id(win);
+            return [monitor, this.should_ignore_workspace(monitor) ? 0 : workspace];
+        };
+
+        interface TreePlan {
+            fork: Fork;
+            windows: Array<Window.ShellWindow>;
+            target: [number, number] | null;
+        }
+
+        const plans: Array<TreePlan> = [];
+
+        for (const fork of Array.from(forest.forks.values())) {
+            if (!fork.is_toplevel) continue;
+
+            const windows: Array<Window.ShellWindow> = [];
+            for (const child of forest.iter(fork.entity)) {
+                const entities =
+                    child.inner.kind === 2 ? [child.inner.entity] : child.inner.kind === 3 ? child.inner.entities : [];
+
+                for (const entity of entities) {
+                    const win = this.windows.get(entity);
+                    if (win && win.actor_exists()) windows.push(win);
                 }
+            }
 
-                apply_migrations(assigned_monitors);
+            if (windows.length === 0) continue;
 
-                return;
-            })();
+            let target: [number, number] | null = destination(windows[0]);
+            for (const win of windows) {
+                const [mon, ws] = destination(win);
+                if (target && (mon !== target[0] || ws !== target[1])) target = null;
+            }
 
-            this.displays_updating = null;
-            return false;
-        });
+            plans.push({ fork, windows, target });
+        }
+
+        // When several trees head for the same place, keep the one that is
+        // already there, else the biggest, intact; the others merge into it.
+        const keeper = new Map<string, TreePlan>();
+        for (const plan of plans) {
+            if (!plan.target) continue;
+
+            const key = plan.target.join(':');
+            const current = keeper.get(key);
+            const already_there = (p: TreePlan) =>
+                p.target !== null && p.fork.monitor === p.target[0] && p.fork.workspace === p.target[1];
+
+            if (
+                !current ||
+                (already_there(plan) && !already_there(current)) ||
+                (already_there(plan) === already_there(current) && plan.windows.length > current.windows.length)
+            ) {
+                keeper.set(key, plan);
+            }
+        }
+
+        const merges: Array<Window.ShellWindow> = [];
+
+        for (const plan of plans) {
+            const target = plan.target;
+
+            if (target && keeper.get(target.join(':')) === plan) {
+                const [mon, ws] = target;
+                plan.fork.migrate(this, forest, this.monitor_work_area(mon).clone(), mon, ws);
+            } else {
+                merges.push(...plan.windows);
+            }
+        }
+
+        for (const win of merges) {
+            tiler.detach_window(this, win.entity);
+        }
+
+        for (const win of merges) {
+            const target = destination(win);
+            this.monitors.insert(win.entity, target);
+            tiler.attach_to_workspace(this, win, target);
+        }
+
+        for (const [entity, win] of this.windows.iter()) {
+            if (!win.actor_exists()) continue;
+
+            this.monitors.insert(entity, this.workspace_id(win));
+            // A window Mutter left on a secondary monitor keeps its home for later
+            win.update_home_workspace(true);
+        }
+
+        this.retile_toplevels();
     }
 
     update_scale() {

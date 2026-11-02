@@ -7,6 +7,7 @@ declare class TextDecoder {
 }
 
 interface Global {
+    backend: any;
     get_current_time(): number;
     get_pointer(): [number, number];
     get_window_actors(): Array<Meta.WindowActor>;
@@ -313,6 +314,7 @@ declare namespace Meta {
         is_above(): boolean;
         is_attached_dialog(): boolean;
         is_fullscreen(): boolean;
+        is_always_on_all_workspaces(): boolean;
         is_on_all_workspaces(): boolean;
         is_override_redirect(): boolean;
         is_skip_taskbar(): boolean;
@@ -320,10 +322,13 @@ declare namespace Meta {
         make_fullscreen(): void;
         maximize(flags?: MaximizeFlags): void;
         move_frame(user_op: boolean, x: number, y: number): void;
+        move_to_monitor(monitor: number): void;
         move_resize_frame(user_op: boolean, x: number, y: number, w: number, h: number): boolean;
         raise(): void;
         skip_taskbar: boolean;
+        stick(): void;
         unmaximize(flags?: any): void;
+        unstick(): void;
         unminimize(): void;
     }
 
