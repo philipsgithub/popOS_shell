@@ -71,22 +71,6 @@ export class ShellWindow {
     meta: Meta.Window;
     ext: Ext;
     stack: number | null = null;
-    /**
-     * The workspace this window last had on a monitor with workspaces. With
-     * workspaces-only-on-primary, Mutter forgets it while the window is on a
-     * secondary monitor (e.g. while a dock brings its monitors up one by one)
-     * and later drops it on the active workspace; this lets us send it back.
-     * `null` when the user put the window on a secondary monitor or on all
-     * workspaces.
-     */
-    home_workspace: number | null = null;
-
-    /**
-     * The connector of the monitor this window belongs on. Kept while that
-     * monitor is unplugged, so the window can return to it; Mutter's own
-     * choice is unreliable when a dock brings its monitors up one by one.
-     */
-    home_monitor: string | null = null;
     grab: boolean = false;
     activate_after_move: boolean = false;
     ignore_detach: boolean = false;
@@ -119,9 +103,6 @@ export class ShellWindow {
         this.entity = entity;
         this.meta = window;
         this.ext = ext;
-
-        this.update_home_workspace(false);
-        this.update_home_monitor();
 
         // Float fullscreen windows by default, such as Kodi.
         if (this.meta.is_fullscreen()) {
@@ -427,29 +408,6 @@ export class ShellWindow {
     title(): string {
         const title = this.meta.get_title();
         return title ? title : this.name(this.ext);
-    }
-
-    /**
-     * Records the window's current workspace as its home. A window shown on
-     * all workspaces has none, unless `keep_if_sticky` (Mutter made it sticky
-     * by moving it, not the user).
-     */
-    update_home_workspace(keep_if_sticky: boolean) {
-        if (this.meta.is_on_all_workspaces()) {
-            if (!keep_if_sticky) this.home_workspace = null;
-            return;
-        }
-
-        const workspace = this.meta.get_workspace();
-        if (workspace) this.home_workspace = workspace.index();
-    }
-
-    /** Records the window's current monitor as its home, unless its home is unplugged. */
-    update_home_monitor() {
-        const home = this.home_monitor;
-        if (home !== null && utils.monitor_for_connector(home) === -1) return;
-
-        this.home_monitor = utils.monitor_connector(this.meta.get_monitor());
     }
 
     workspace_id(): number {

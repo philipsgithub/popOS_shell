@@ -23,6 +23,7 @@ import * as stack from './stack.js';
 import * as add_exception from './dialog_add_exception.js';
 import * as dbus_service from './dbus_service.js';
 import * as scheduler from './scheduler.js';
+import * as placements from './placements.js';
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import type { Entity } from './ecs.js';
 import type { ExtEvent } from './events.js';
@@ -88,6 +89,17 @@ interface Display {
 
 interface Monitor extends Rectangular {
     index: number;
+}
+
+/** Where a window goes after a monitor change; see `Ext.placement_target()` */
+interface PlacementTarget {
+    monitor: number;
+    /** `null` when unknown, or on all workspaces */
+    workspace: number | null;
+    /** Frame rectangle relative to the monitor, if known */
+    rect: [number, number, number, number] | null;
+    /** Whether the window has been in this monitor setup before */
+    known: boolean;
 }
 
 interface Injection {
@@ -192,6 +204,14 @@ export class Ext extends Ecs.System<ExtEvent> {
 
     /** True while Mutter moves windows after a monitor change, until `reassign_trees_to_displays()` */
     display_reconfiguring: boolean = false;
+
+    /** The monitor setup (`placements.setup_key()`) that window placements are recorded for */
+    setup: string | null = null;
+
+    /** Windows that moved since their placement was last recorded */
+    private placements_dirty: Set<Window.ShellWindow> = new Set();
+
+    private placements_timer: null | SignalID = null;
 
     /** Record of misc. global objects and their attached signals */
     private signals: Map<GObject.Object, Array<SignalID>> = new Map();
@@ -371,7 +391,6 @@ export class Ext extends Ecs.System<ExtEvent> {
                     case WindowEvent.Workspace:
                         if (this.display_reconfiguring) break;
 
-                        win.update_home_workspace(false);
                         this.on_workspace_changed(win);
                         break;
 
@@ -832,6 +851,10 @@ export class Ext extends Ecs.System<ExtEvent> {
                 }
             }
         }
+
+        try {
+            placements.forget(window.meta.get_stable_sequence());
+        } catch (_) { }
 
         this.movements.remove(win);
         this.windows.remove(win);
@@ -1685,6 +1708,15 @@ export class Ext extends Ecs.System<ExtEvent> {
             if (win.is_tilable(this)) {
                 this.connect_window(win);
             }
+
+            // Floating windows too, so they return to the exact spot
+            for (const signal of ['position-changed', 'size-changed', 'workspace-changed']) {
+                this.connect_meta(win, signal, () => {
+                    if (win) this.queue_placement(win);
+                });
+            }
+
+            this.queue_placement(win);
         }
     }
 
@@ -1858,8 +1890,8 @@ export class Ext extends Ecs.System<ExtEvent> {
         this.connect(display, 'window-entered-monitor', (_display: Meta.Display, _monitor: number, meta: Meta.Window) => {
             // Queued, so that a reconfiguration flagged by monitors-changed is seen
             this.register_fn(() => {
-                if (this.display_reconfiguring) return;
-                this.get_window(meta)?.update_home_monitor();
+                const win = this.get_window(meta);
+                if (win) this.queue_placement(win);
             });
         });
 
@@ -1929,6 +1961,9 @@ export class Ext extends Ecs.System<ExtEvent> {
 
             if (sessionMode.isLocked) {
                 this.exit_modes();
+            } else if (this.display_reconfiguring && this.displays_updating === null) {
+                // Monitors changed while the screen was locked
+                this.register(Events.global(GlobalEvent.MonitorsChanged));
             }
         });
 
@@ -2106,6 +2141,13 @@ export class Ext extends Ecs.System<ExtEvent> {
         }
 
         this.display_reconfiguring = false;
+
+        if (this.placements_timer !== null) {
+            GLib.source_remove(this.placements_timer);
+            this.placements_timer = null;
+        }
+
+        this.placements_dirty.clear();
 
         Window.clear_timers();
     }
@@ -2324,10 +2366,9 @@ export class Ext extends Ecs.System<ExtEvent> {
         // Work-area updates during a monitor change are part of it
         if (this.display_reconfiguring) workareas_only = false;
 
-        if (!this.auto_tiler || sessionMode.isLocked) {
-            if (this.displays_updating === null) this.display_reconfiguring = false;
-            return;
-        }
+        // Monitors that change while the screen is locked are dealt with once
+        // it is unlocked; the flag stays set until then.
+        if (sessionMode.isLocked) return;
 
         if (this.ignore_display_update) {
             this.ignore_display_update = false;
@@ -2394,12 +2435,10 @@ export class Ext extends Ecs.System<ExtEvent> {
             updated.set(mon.index, { area, ws });
         }
 
-        const old_displays = this.displays[1];
-
         this.displays = [primary_display, updated];
 
         // Work areas changed (panels, struts, resolution): just refit the trees.
-        if (workareas_only && old_displays.size === updated.size) {
+        if (workareas_only && placements.setup_key() === this.setup) {
             this.retile_toplevels();
             return;
         }
@@ -2421,7 +2460,7 @@ export class Ext extends Ecs.System<ExtEvent> {
                 this.displays_updating = null;
 
                 // Wayland clients take a moment to follow a move to another monitor
-                if (this.return_windows_to_home_monitors() && attempt < 8) {
+                if (this.restore_monitors() && attempt < 8) {
                     settle(attempt + 1);
                 } else {
                     this.display_reconfiguring = false;
@@ -2435,38 +2474,156 @@ export class Ext extends Ecs.System<ExtEvent> {
         settle(0);
     }
 
+    /** Records where `win` is shortly, once it is done moving. */
+    queue_placement(win: Window.ShellWindow) {
+        this.placements_dirty.add(win);
+        if (this.placements_timer !== null) return;
+
+        this.placements_timer = GLib.timeout_add(GLib.PRIORITY_LOW, 250, () => {
+            this.placements_timer = null;
+
+            for (const dirty of this.placements_dirty) {
+                if (!dirty.destroying) this.record_placement(dirty);
+            }
+
+            this.placements_dirty.clear();
+            return false;
+        });
+    }
+
+    /** Records where `win` is, for the current monitor setup. */
+    record_placement(win: Window.ShellWindow) {
+        if (this.display_reconfiguring || this.setup === null || sessionMode.isLocked) return;
+        if (!win.actor_exists()) return;
+
+        // Mutter is already moving windows for a new monitor setup
+        if (placements.setup_key() !== this.setup) return;
+
+        const meta = win.meta;
+        const monitor = meta.get_monitor();
+        const connector = utils.monitor_connector(monitor);
+        if (connector === null) return;
+
+        const geometry = global.display.get_monitor_geometry(monitor);
+        if (!geometry) return;
+
+        const frame = meta.get_frame_rect();
+
+        placements.record(meta.get_stable_sequence(), this.setup, {
+            connector,
+            primary: monitor === global.display.get_primary_monitor(),
+            workspace: meta.is_on_all_workspaces() ? null : meta.get_workspace()?.index() ?? null,
+            rect: [frame.x - geometry.x, frame.y - geometry.y, frame.width, frame.height],
+        });
+    }
+
+    record_all_placements() {
+        for (const win of this.windows.values()) this.record_placement(win);
+    }
+
     /**
-     * Mutter's placement of windows is unreliable while a dock brings its
-     * monitors up one by one. Moves every window whose monitor is connected
-     * (again) back onto it; returns whether any window is not there yet.
+     * Where `win` belongs under the monitor setup `setup`:
+     *
+     * - where it was the last time this setup was active;
+     * - else, if it was on a secondary monitor that is still connected, there;
+     * - else on the primary monitor, on the workspace it was on.
      */
-    return_windows_to_home_monitors(): boolean {
+    placement_target(win: Window.ShellWindow, setup: string): PlacementTarget {
+        const window = win.meta.get_stable_sequence();
+
+        const known = placements.get(window, setup);
+        if (known) {
+            const monitor = utils.monitor_for_connector(known.connector);
+            if (monitor !== -1) return { monitor, workspace: known.workspace, rect: known.rect, known: true };
+        }
+
+        const last = placements.last(window);
+        if (last && !last.primary) {
+            const monitor = utils.monitor_for_connector(last.connector);
+            if (monitor !== -1 && monitor !== global.display.get_primary_monitor()) {
+                return { monitor, workspace: last.workspace, rect: last.rect, known: false };
+            }
+        }
+
+        return {
+            monitor: global.display.get_primary_monitor(),
+            workspace: placements.last_workspace(window),
+            rect: last?.rect ?? null,
+            known: false,
+        };
+    }
+
+    /**
+     * Moves every window onto its monitor under the current setup (see
+     * `placement_target()`). Returns whether any window is not there yet:
+     * Wayland clients take a moment to follow a move to another monitor.
+     */
+    restore_monitors(): boolean {
+        const setup = placements.setup_key();
         let moving = false;
 
         for (const win of this.windows.values()) {
-            if (win.home_monitor === null || !win.actor_exists()) continue;
+            if (!win.actor_exists()) continue;
 
-            const home = utils.monitor_for_connector(win.home_monitor);
-            if (home === -1 || home === win.meta.get_monitor()) continue;
+            const meta = win.meta;
+            const target = this.placement_target(win, setup);
+            const on_target = meta.get_monitor() === target.monitor;
 
-            if (win.is_maximized() || win.meta.is_fullscreen()) {
-                win.meta.move_to_monitor(home);
-            } else {
-                // move_to_monitor() ignores windows Mutter has in that half-moved
-                // state; place it inside the monitor (it is retiled afterwards).
-                const area = this.monitor_work_area(home);
-                const rect = win.meta.get_frame_rect();
-                const width = Math.min(rect.width, area.width);
-                const height = Math.min(rect.height, area.height);
-                const x = area.x + Math.round((area.width - width) / 2);
-                const y = area.y + Math.round((area.height - height) / 2);
-                win.meta.move_resize_frame(true, x, y, width, height);
+            if (win.is_maximized() || meta.is_fullscreen()) {
+                if (on_target) continue;
+
+                meta.move_to_monitor(target.monitor);
+                moving = true;
+                continue;
             }
 
+            // move_to_monitor() ignores windows Mutter has in a half-moved
+            // state; place the window inside the monitor instead.
+            const [x, y, width, height] = this.placement_frame(win, target);
+
+            if (on_target) {
+                // Tiled windows are retiled afterwards; floating ones return to their spot
+                if (!target.known || this.auto_tiler?.attached.contains(win.entity)) continue;
+
+                const frame = meta.get_frame_rect();
+                if (frame.x === x && frame.y === y && frame.width === width && frame.height === height) continue;
+
+                meta.move_resize_frame(true, x, y, width, height);
+                continue;
+            }
+
+            meta.move_resize_frame(true, x, y, width, height);
             moving = true;
         }
 
         return moving;
+    }
+
+    /**
+     * The frame rectangle for `win` at `target`: where it was, if it has been in
+     * this setup before, else kept within the monitor's work area.
+     */
+    placement_frame(win: Window.ShellWindow, target: PlacementTarget): [number, number, number, number] {
+        const area = this.monitor_work_area(target.monitor);
+        const geometry = global.display.get_monitor_geometry(target.monitor) ?? area;
+        const current = win.meta.get_frame_rect();
+
+        const [rx, ry, rw, rh] = target.rect ?? [
+            Math.round((geometry.width - current.width) / 2),
+            Math.round((geometry.height - current.height) / 2),
+            current.width,
+            current.height,
+        ];
+
+        // Back where it was in this setup, as Mutter allowed it then
+        if (target.known) return [geometry.x + rx, geometry.y + ry, rw, rh];
+
+        const width = Math.min(rw, area.width);
+        const height = Math.min(rh, area.height);
+        const x = Math.max(area.x, Math.min(geometry.x + rx, area.x + area.width - width));
+        const y = Math.max(area.y, Math.min(geometry.y + ry, area.y + area.height - height));
+
+        return [x, y, width, height];
     }
 
     /** Fits every toplevel tree to the current work area of its monitor. */
@@ -2486,42 +2643,69 @@ export class Ext extends Ecs.System<ExtEvent> {
     }
 
     /**
-     * After monitors were added or removed, makes the tiling trees follow
-     * their windows to wherever Mutter put them, keeping every window on its
-     * workspace.
+     * Once the windows are on their monitors after a monitor change (see
+     * `restore_monitors()`), puts them on their workspaces, makes the tiling
+     * trees follow, and starts recording placements for the new setup.
+     */
+    reassign_trees_to_displays() {
+        const tiler = this.auto_tiler;
+
+        const setup = placements.setup_key();
+
+        // Put every window back on its workspace. With workspaces-only-on-primary,
+        // a window that passed through a secondary monitor lost it: Mutter
+        // leaves it on all workspaces, or drops it on the active one, once it
+        // is back on the primary.
+        const n_workspaces = global.workspace_manager.get_n_workspaces();
+        const active = global.workspace_manager.get_active_workspace_index();
+
+        for (const win of this.windows.values()) {
+            if (!win.actor_exists()) continue;
+
+            const meta = win.meta;
+            if (this.should_ignore_workspace(meta.get_monitor()) || meta.is_always_on_all_workspaces()) continue;
+
+            const target = this.placement_target(win, setup);
+            const recorded = target.workspace ?? placements.last_workspace(meta.get_stable_sequence()) ?? active;
+            const workspace = Math.min(recorded, n_workspaces - 1);
+
+            // Not pinned by the user: have Mutter re-evaluate that now that it is on a monitor with workspaces
+            if (meta.is_on_all_workspaces()) {
+                meta.stick();
+                meta.unstick();
+            }
+
+            if (meta.get_workspace()?.index() !== workspace) meta.change_workspace_by_index(workspace, false);
+        }
+
+        this.setup = setup;
+
+        if (tiler) this.reassign_trees(tiler);
+
+        const alive: Set<number> = new Set();
+        for (const [entity, win] of this.windows.iter()) {
+            if (!win.actor_exists()) continue;
+
+            alive.add(win.meta.get_stable_sequence());
+            this.monitors.insert(entity, this.workspace_id(win));
+        }
+
+        placements.retain(alive);
+        this.record_all_placements();
+
+        this.retile_toplevels();
+    }
+
+    /**
+     * Makes the tiling trees follow their windows to their monitors and workspaces.
      *
      * - A tree whose windows all share one destination, which no other tree
      *   claims, moves there intact (splits and ratios are kept).
      * - Otherwise the tree is dissolved, and each of its windows is tiled
      *   into the tree at its own destination (merging into what's there).
      */
-    reassign_trees_to_displays() {
-        const tiler = this.auto_tiler;
-        if (!tiler) return;
-
+    reassign_trees(tiler: auto_tiler.AutoTiler) {
         const forest = tiler.forest;
-
-        // With workspaces-only-on-primary, a window that passed through a
-        // secondary monitor lost its workspace: Mutter leaves it on all
-        // workspaces, or drops it on the active one, once it is back on the
-        // primary. Send it back home.
-        const n_workspaces = global.workspace_manager.get_n_workspaces();
-        for (const win of this.windows.values()) {
-            const home = win.home_workspace;
-            if (home === null || home >= n_workspaces || !win.actor_exists()) continue;
-
-            const meta = win.meta;
-            if (this.should_ignore_workspace(meta.get_monitor()) || meta.is_always_on_all_workspaces()) continue;
-
-            // Still having a home means the user did not pin it to all
-            // workspaces; have Mutter re-evaluate that now it is on the primary.
-            if (meta.is_on_all_workspaces()) {
-                meta.stick();
-                meta.unstick();
-            }
-
-            if (meta.get_workspace()?.index() !== home) meta.change_workspace_by_index(home, false);
-        }
 
         const destination = (win: Window.ShellWindow): [number, number] => {
             const [monitor, workspace] = this.workspace_id(win);
@@ -2603,16 +2787,6 @@ export class Ext extends Ecs.System<ExtEvent> {
             this.monitors.insert(win.entity, target);
             tiler.attach_to_workspace(this, win, target);
         }
-
-        for (const [entity, win] of this.windows.iter()) {
-            if (!win.actor_exists()) continue;
-
-            this.monitors.insert(entity, this.workspace_id(win));
-            // A window Mutter left on a secondary monitor keeps its home for later
-            win.update_home_workspace(true);
-        }
-
-        this.retile_toplevels();
     }
 
     update_scale() {
@@ -2798,6 +2972,9 @@ export default class PopShellExtension extends Extension {
 
         ext.injections_add();
         ext.signals_attach();
+
+        ext.setup = placements.setup_key();
+        ext.register_fn(() => ext?.record_all_placements());
 
         disable_window_attention_handler();
 
